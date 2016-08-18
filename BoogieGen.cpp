@@ -27,6 +27,7 @@ std::map<std::string, int> UID_map;
 std::map<int, std::string> UID_inv_map;
 std::map<int, int> UID_size_map;
 
+std::map<int, std::map<std::string, int>> field_map;
 
 void generateFixedCode(void) {
 	os << "var $M.int : [int] int;" << std::endl;
@@ -40,7 +41,6 @@ void generateFixedCode(void) {
 	os << "\tp := $currAddr;" << std::endl;
 	os << "\t$currAddr := $currAddr + n;" << std::endl;
 	os << "}" << std::endl;
-
 
 	//malloc_int procedure
 	os << "procedure malloc_int(n:int) returns (p:int) {" << std::endl;
@@ -60,12 +60,33 @@ private:
 	ASTContext *Context;
 	int UID;
 public:
+	const QualType getBaseType(QualType t) {
+		if (const ElaboratedType *ET = dyn_cast<ElaboratedType>(t.getTypePtr())) {
+			return getBaseType(ET->getNamedType());
+		}
+		else if (const TypedefType *TD = dyn_cast<TypedefType>(t.getTypePtr())) {
+			return getBaseType(TD->getDecl()->getUnderlyingType());
+		}
+		else
+			return t;
+	}
 	bool VisitRecordDecl(RecordDecl *R) {
 		UID_map[R->getName().str()] = UID;
 		UID_inv_map[UID] = R->getName().str();
 		int count = 0;
 		for (RecordDecl::field_iterator f = R->field_begin(); f != R->field_end(); f++) {
-			count+=4;
+			field_map[UID][(*f)->getName()] = count;
+			//(*f)->getType()->dump();
+			const QualType t = getBaseType((*f)->getType());
+			if (t->isStructureType()) {
+				count += UID_size_map[UID_map[(*f)->getType()->getAsStructureType()->getDecl()->getName().str()]];
+			}
+			else if (t->isCharType()) {
+				count += 1;
+			}
+			else {
+				count += 4;
+			}
 		}
 		UID_size_map[UID] = count;
 		UID++;
@@ -159,6 +180,68 @@ private:
 		}
 		return s.str();
 	}
+	int getElementPtr(Expr *E, int indent) {
+		if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
+			return getElementPtr(CE->getSubExpr(), indent);
+		}
+		else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
+			Expr *base = ME->getBase();
+			int b = getElementPtr(base, indent);
+			int t = getNextTemp();
+			std::string l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+			int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
+			fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(b) << " + " << offset << ";" << std::endl;
+			return t;
+		}
+		else if(UnaryOperator *UO = dyn_cast<UnaryOperator>(E)) {
+			if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*") == 0) {
+				return generateStatement(UO->getSubExpr(),indent);
+			}
+			else {
+				fs << nTabs(indent) << "// Invalid operator found in getelementptr" << std::endl;
+				return -1;
+			}
+		}
+		else if (DeclRefExpr *DE = dyn_cast<DeclRefExpr>(E)) {
+			return generateStatement(DE, indent);
+		}
+		else {
+		//	E->dump();
+			fs << nTabs(indent) << "// Invalid expression found in getelementptr" << std::endl;
+			return -1;
+		}
+		return -1;
+	}
+	std::string getLValue(Expr *E, int indent) {
+		if (DeclRefExpr *DE = dyn_cast<DeclRefExpr>(E)) {
+			return symbolTableGetVar(DE->getDecl()->getName().str());
+		}
+		else if (UnaryOperator *UO = dyn_cast<UnaryOperator>(E)) {
+			if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*") == 0) {
+				int t = generateStatement(UO->getSubExpr(), indent);
+				std::stringstream ss;
+				ss << "$M.[" << getAsTemp(t) << "]";
+				return ss.str();
+			}
+			else {
+				fs << nTabs(indent) << "// Invalid unary operator found in getlvalue" << std::endl;
+				return getAsTemp(-1);
+			}
+		}
+		else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
+			Expr *base = ME->getBase();
+			int b = getElementPtr(base, indent);
+			std::string l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+			int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
+			std::stringstream ss;
+			ss << "$M." << l_type << "." << ME->getMemberDecl()->getName().str() << "[" << getAsTemp(b) << " + " << offset << "]";
+			return ss.str();
+		}
+		else {
+			fs << nTabs(indent) << "//Invalid lvalue found" << std::endl;
+			return getAsTemp(-1);
+		}
+	}
 	int generateStatement(Stmt *S, int indent) {
 		if (CompoundStmt *CS = dyn_cast<CompoundStmt>(S)) {
 			int t;
@@ -176,6 +259,12 @@ private:
 				return t;
 			}
 			else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(E)) {
+				if (BO->getOpcodeStr().str().compare("=") == 0) {
+					std::string lvalue = getLValue(BO->getLHS(), indent);
+					int t = generateStatement(BO->getRHS(), indent);
+					fs << nTabs(indent) << lvalue << " := " << getAsTemp(t) << ";" << std::endl;
+					return t;
+				}
 				int lhs = generateStatement(BO->getLHS(), indent);
 				int rhs = generateStatement(BO->getRHS(), indent);
 				int t = getNextTemp();
@@ -272,7 +361,13 @@ private:
 				return -1;
 			}
 			else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
-
+				Expr *base = ME->getBase();
+				int b = getElementPtr(base, indent);
+				int t = getNextTemp();
+				std::string l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+				int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
+				fs << nTabs(indent) << getAsTemp(t) << " := $M." << l_type << "." << ME->getMemberDecl()->getName().str() << "[" << getAsTemp(b) << " + " << offset << "];" << std::endl;
+				return t;
 			}
 			else {
 				generateTabs(indent);
@@ -292,6 +387,10 @@ private:
 					symbolTableCreateVar(VD->getName().str());
 					varList.insert(symbolTableGetVar(VD->getName().str()));
 					fs << nTabs(indent) << "havoc " << symbolTableGetVar(VD->getName().str()) << ";" << std::endl;
+					if (VD->getType()->isStructureType()) {
+						std::string sname = VD->getType()->getAsStructureType()->getDecl()->getName().str();
+						fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := $malloc_" << sname << "(1);" << std::endl;
+					}
 					if (VD->hasInit()) {
 						int t = generateStatement(VD->getInit(), indent);
 						fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := " << getAsTemp(t) << ";" << std::endl;
