@@ -191,7 +191,7 @@ private:
 				generateStructCopy((*f)->getType(), lhs_base, rhs_base, offset, indent);
 			}
 			else {
-				fs << nTabs(indent) << "$M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(lhs_base) << " + " << offset + base_offset << "] = $M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(rhs_base) << " + " << offset + base_offset << "]" << std::endl;
+				fs << nTabs(indent) << "$M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(lhs_base) << " + " << offset + base_offset << "] = $M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(rhs_base) << " + " << offset + base_offset << "];" << std::endl;
 			}
 		}
 		return rhs_base;
@@ -202,9 +202,17 @@ private:
 		}
 		else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
 			Expr *base = ME->getBase();
-			int b = getElementPtr(base, indent);
+			int b;
+			std::string l_type;
 			int t = getNextTemp();
-			std::string l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+			if (ME->isArrow()) {
+				b = generateStatement(base, indent);
+				l_type = base->getType()->getPointeeType()->getAsStructureType()->getDecl()->getName().str();
+			}
+			else {
+				b = getElementPtr(base, indent);
+				l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+			}
 			int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
 			fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(b) << " + " << offset << ";" << std::endl;
 			return t;
@@ -246,8 +254,16 @@ private:
 		}
 		else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
 			Expr *base = ME->getBase();
-			int b = getElementPtr(base, indent);
-			std::string l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+			int b;
+			std::string l_type;
+			if (ME->isArrow()) {
+				b = generateStatement(base, indent);
+				l_type = base->getType()->getPointeeType()->getAsStructureType()->getDecl()->getName().str();
+			}
+			else {
+				b = getElementPtr(base, indent);
+				l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+			}
 			int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
 			std::stringstream ss;
 			ss << "$M." << l_type << "." << ME->getMemberDecl()->getName().str() << "[" << getAsTemp(b) << " + " << offset << "]";
@@ -260,7 +276,7 @@ private:
 	}
 	int generateStatement(Stmt *S, int indent) {
 		if (CompoundStmt *CS = dyn_cast<CompoundStmt>(S)) {
-			int t;
+			int t=-1;
 			symbolTableEnterLevel();
 			for (CompoundStmt::body_iterator b = CS->body_begin(); b != CS->body_end(); b++) {
 				t=generateStatement(*b, indent);
@@ -291,7 +307,7 @@ private:
 				int lhs = generateStatement(BO->getLHS(), indent);
 				int rhs = generateStatement(BO->getRHS(), indent);
 				int t = getNextTemp();
-				fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << std::endl;
+				fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << ";" << std::endl;
 				return t;
 			}
 			else if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
@@ -385,9 +401,18 @@ private:
 			}
 			else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
 				Expr *base = ME->getBase();
-				int b = getElementPtr(base, indent);
+				int b;
+				
 				int t = getNextTemp();
-				std::string l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+				std::string l_type;
+				if (ME->isArrow()) {
+					l_type = base->getType()->getPointeeType()->getAsStructureType()->getDecl()->getName().str();
+					b = generateStatement(base, indent);
+				}
+				else {
+					b = getElementPtr(base, indent);
+					l_type = base->getType()->getAsStructureType()->getDecl()->getName().str();
+				}
 				int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
 				fs << nTabs(indent) << getAsTemp(t) << " := $M." << l_type << "." << ME->getMemberDecl()->getName().str() << "[" << getAsTemp(b) << " + " << offset << "];" << std::endl;
 				return t;
@@ -445,15 +470,31 @@ public:
 		symbolTableEnterLevel();
 		varList.clear();
 		os << "procedure " << F->getName().str() << "(";
+		fs.str(std::string());
+		resetTemp();
 		for (FunctionDecl::param_iterator p = F->param_begin(); p != F->param_end(); p++) {
-			symbolTableCreateVar((*p)->getName().str());
-			os << symbolTableGetVar((*p)->getName().str()) << " : int";
+			if ((*p)->getType()->isStructureType()) {
+				os << (*p)->getName().str() << "$ptr" << " : int";
+				int lhs_base = getNextTemp();
+				int rhs_base = getNextTemp();
+				fs << "\t" << getAsTemp(lhs_base) << " := " << (*p)->getName().str() << "$ptr;" << std::endl;
+				symbolTableCreateVar((*p)->getName().str());
+				fs << "\t" << "havoc " << symbolTableGetVar((*p)->getName().str()) << ";" << std::endl;
+				fs << "\t" << symbolTableGetVar((*p)->getName().str()) << " := $malloc_" << (*p)->getType()->getAsStructureType()->getDecl()->getName().str() << "(1);" << std::endl;
+				fs << "\t" << getAsTemp(rhs_base) << " := " << symbolTableGetVar((*p)->getName().str()) << ";" << std::endl;
+				generateStructCopy((*p)->getType(), lhs_base, rhs_base, 0, 1);
+			}
+			else {
+				symbolTableCreateVar((*p)->getName().str());
+				os << symbolTableGetVar((*p)->getName().str()) << " : int";
+			}
+			
 			if (p + 1 != F->param_end())
 				os << ", ";
 		}
 		os << ") returns ($return : int) {" << std::endl;
-		resetTemp();
-		fs.str(std::string());
+		
+		
 		generateStatement(F->getBody(),1);
 		for (std::unordered_set<std::string>::iterator var = varList.begin(); var != varList.end(); var++)
 			os << "\t" << "var " << *var << " : int;" << std::endl;
