@@ -55,28 +55,29 @@ void generateFixedCode(void) {
 	os << "}" << std::endl;
 }
 
+const QualType getBaseType(QualType t) {
+	if (const ElaboratedType *ET = dyn_cast<ElaboratedType>(t.getTypePtr())) {
+		return getBaseType(ET->getNamedType());
+	}
+	else if (const TypedefType *TD = dyn_cast<TypedefType>(t.getTypePtr())) {
+		return getBaseType(TD->getDecl()->getUnderlyingType());
+	}
+	else
+		return t;
+}
+
 class CollectStructInfoVisitor : public RecursiveASTVisitor<CollectStructInfoVisitor> {
 private:
 	ASTContext *Context;
 	int UID;
 public:
-	const QualType getBaseType(QualType t) {
-		if (const ElaboratedType *ET = dyn_cast<ElaboratedType>(t.getTypePtr())) {
-			return getBaseType(ET->getNamedType());
-		}
-		else if (const TypedefType *TD = dyn_cast<TypedefType>(t.getTypePtr())) {
-			return getBaseType(TD->getDecl()->getUnderlyingType());
-		}
-		else
-			return t;
-	}
+	
 	bool VisitRecordDecl(RecordDecl *R) {
 		UID_map[R->getName().str()] = UID;
 		UID_inv_map[UID] = R->getName().str();
 		int count = 0;
 		for (RecordDecl::field_iterator f = R->field_begin(); f != R->field_end(); f++) {
 			field_map[UID][(*f)->getName()] = count;
-			//(*f)->getType()->dump();
 			const QualType t = getBaseType((*f)->getType());
 			if (t->isStructureType()) {
 				count += UID_size_map[UID_map[(*f)->getType()->getAsStructureType()->getDecl()->getName().str()]];
@@ -180,6 +181,21 @@ private:
 		}
 		return s.str();
 	}
+	int generateStructCopy(QualType t, int lhs_base, int rhs_base, int base_offset, int indent ) {
+		RecordDecl *RD = t->getAsStructureType()->getDecl();
+		for (RecordDecl::field_iterator f = RD->field_begin(); f != RD->field_end(); f++) {
+			const QualType t = getBaseType((*f)->getType());
+			std::string l_type = RD->getName().str();
+			int offset = field_map[UID_map[l_type]][(*f)->getName().str()];
+			if (t->isStructureType()) {
+				generateStructCopy((*f)->getType(), lhs_base, rhs_base, offset, indent);
+			}
+			else {
+				fs << nTabs(indent) << "$M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(lhs_base) << " + " << offset + base_offset << "] = $M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(rhs_base) << " + " << offset + base_offset << "]" << std::endl;
+			}
+		}
+		return rhs_base;
+	}
 	int getElementPtr(Expr *E, int indent) {
 		if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
 			return getElementPtr(CE->getSubExpr(), indent);
@@ -260,10 +276,17 @@ private:
 			}
 			else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(E)) {
 				if (BO->getOpcodeStr().str().compare("=") == 0) {
-					std::string lvalue = getLValue(BO->getLHS(), indent);
-					int t = generateStatement(BO->getRHS(), indent);
-					fs << nTabs(indent) << lvalue << " := " << getAsTemp(t) << ";" << std::endl;
-					return t;
+					if (BO->getRHS()->getType()->isStructureType()) {
+						int lhs_base = getElementPtr(BO->getLHS(), indent);
+						int rhs_base = getElementPtr(BO->getRHS(), indent);
+						return generateStructCopy(BO->getRHS()->getType(), lhs_base, rhs_base, 0, indent);
+					}
+					else {
+						std::string lvalue = getLValue(BO->getLHS(), indent);
+						int t = generateStatement(BO->getRHS(), indent);
+						fs << nTabs(indent) << lvalue << " := " << getAsTemp(t) << ";" << std::endl;
+						return t;
+					}
 				}
 				int lhs = generateStatement(BO->getLHS(), indent);
 				int rhs = generateStatement(BO->getRHS(), indent);
@@ -392,8 +415,16 @@ private:
 						fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := $malloc_" << sname << "(1);" << std::endl;
 					}
 					if (VD->hasInit()) {
-						int t = generateStatement(VD->getInit(), indent);
-						fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := " << getAsTemp(t) << ";" << std::endl;
+						if (VD->getType()->isStructureType()) {
+							int rhs_base = getElementPtr(VD->getInit(), indent);
+							int lhs_base = getNextTemp();
+							fs << nTabs(indent) << getAsTemp(lhs_base) << " := " << symbolTableGetVar(VD->getName().str()) << ";" << std::endl;
+							generateStructCopy(VD->getType(), lhs_base, rhs_base, 0, indent);
+						}
+						else {
+							int t = generateStatement(VD->getInit(), indent);
+							fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := " << getAsTemp(t) << ";" << std::endl;
+						}
 					}
 				}
 				
