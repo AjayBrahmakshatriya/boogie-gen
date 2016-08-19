@@ -33,7 +33,7 @@ void generateFixedCode(void) {
 	os << "var $M.int : [int] int;" << std::endl;
 	os << "var $M._size : [int] int;" << std::endl;
 	os << "var $M._type : [int] int;" << std::endl;
-	os << "var $M._C : [int] int;" << std::endl;
+	os << "var $M._C : [int] [int] int;" << std::endl;
 	os << "var $currAddr : int;" << std::endl;
 
 	//malloc procedure
@@ -53,6 +53,27 @@ void generateFixedCode(void) {
 	os << "procedure $cast_void(p:int) returns (q:int) {" << std::endl;
 	os << "\tq := p;" << std::endl;
 	os << "}" << std::endl;
+
+	//cast in procedure
+	os << "procedure $cast_int(p:int) returns (q:int) {" << std::endl;
+	os << "\tassert $M._C[0][$M._type[p]] == 1;" << std::endl;
+	os << "\tq := p;" << std::endl;
+	os << "}" << std::endl;
+
+}
+
+void generateInitializeFunction(void) {
+	os << "procedure {:entrypoint} $initialize() {" << std::endl;
+	os << "\t" << "var $temp_0 : int;" << std::endl;
+	os << "\t" << "$currAddr := 1024;" << std::endl;
+	for (std::map<std::string, int>::iterator it = UID_map.begin(); it != UID_map.end(); it++) {
+		for (std::map<std::string, int>::iterator it2 = UID_map.begin(); it2 != UID_map.end(); it2++) {
+			os << "\t" << "$M._C[" << it->second << "][" << it2->second << "] := " << ((it->second == it2->second) ? 1 : 0) << ";" << std::endl;
+		}
+	}
+
+	os << "\t" << "call $temp_0 := main();" << std::endl;
+	os << "}" << std::endl;
 }
 
 const QualType getBaseType(QualType t) {
@@ -65,6 +86,43 @@ const QualType getBaseType(QualType t) {
 	else
 		return t;
 }
+
+bool compileCheckErrored = false;
+
+class CompileChecksVisitor : public RecursiveASTVisitor<CompileChecksVisitor> {
+private:
+	ASTContext *Context;
+public:
+	explicit CompileChecksVisitor(ASTContext *Context) : Context(Context) {}
+
+	bool VisitStmt(Stmt *E) {
+		if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
+			if (CE->getCastKind() == CK_LValueToRValue || CE->getCastKind() == CK_FunctionToPointerDecay)
+				return true;
+			if (CE->getType()->isPointerType()) {
+				if (!CE->getSubExpr()->getType()->isPointerType()) {
+					errs() << CE->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Only pointers can be casted to pointers. Attempted casting " << CE->getSubExpr()->getType().getAsString() << " to " << CE->getType().getAsString() << ".\n";
+					compileCheckErrored = true;
+				}
+			}
+		}
+		else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(E)) {
+			if (BO->getOpcodeStr().compare("+") == 0 || BO->getOpcodeStr().compare("-") == 0 || BO->getOpcodeStr().compare("/") == 0 || BO->getOpcodeStr().compare("*") == 0 || BO->getOpcodeStr().compare("&") == 0 || BO->getOpcodeStr().compare("|") == 0) {
+				if (BO->getLHS()->getType()->isPointerType() || BO->getRHS()->getType()->isPointerType()) {
+					errs() << BO->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Cant perform arithmetic operations on pointers. Prohibited.\n";
+					compileCheckErrored = true;
+				}
+			}
+		}
+		else if (UnaryOperator *UO = dyn_cast<UnaryOperator>(E)) {
+			if (UO->getOpcodeStr(UO->getOpcode()).compare("&")==0) {
+				errs() << UO->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Address of operator(&) prohibited.\n";
+				compileCheckErrored = true;
+			}
+		}
+		return true;
+	}
+};
 
 class CollectStructInfoVisitor : public RecursiveASTVisitor<CollectStructInfoVisitor> {
 private:
@@ -93,7 +151,10 @@ public:
 		UID++;
 		return true;
 	}
-	explicit CollectStructInfoVisitor(ASTContext *Context) : Context(Context), UID(1) {}
+	explicit CollectStructInfoVisitor(ASTContext *Context) : Context(Context), UID(1) {
+		UID_map["int"] = 0;
+		UID_inv_map[0] = "int";
+	}
 };
 class CreateStructDefsVisitor : public RecursiveASTVisitor<CreateStructDefsVisitor> {
 private:
@@ -103,7 +164,7 @@ public:
 		int UID = UID_map[R->getName().str()];
 		os << "// UID(" << R->getName().str() << ") = "<<UID<<std::endl;
 		for (RecordDecl::field_iterator f = R->field_begin(); f != R->field_end(); f++) {
-			os << "var $M." << R->getName().str() << "." << f->getName().str() << " : [int] int" << std::endl;
+			os << "var $M." << R->getName().str() << "." << f->getName().str() << " : [int] int;" << std::endl;
 		}
 		// struct malloc
 		os << "procedure malloc_" << R->getName().str() << "(n:int) returns (p:int) {" << std::endl;
@@ -311,7 +372,26 @@ private:
 				return t;
 			}
 			else if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
-				return generateStatement(CE->getSubExpr(), indent);
+				int t = generateStatement(CE->getSubExpr(), indent);
+				
+				if (CE->getCastKind() == CK_LValueToRValue)
+					return t;
+				int r = getNextTemp();
+				if (CE->getType()->isPointerType()) {
+					QualType ty = CE->getType()->getPointeeType();
+					std::string tname;
+					if (ty->isStructureType()) {
+						tname = ty->getAsStructureType()->getDecl()->getName().str();
+					}
+					else if (ty->isVoidType()) {
+						tname = "void";
+					}
+					else{
+						tname = "int";
+					}
+					fs << nTabs(indent) << "call " << getAsTemp(r) << " := $cast_" << tname << "(" << getAsTemp(t) << ");" << std::endl;
+				}
+				return r;
 			}
 			else if (CharacterLiteral *CL = dyn_cast<CharacterLiteral>(E)) {
 				int t = getNextTemp();
@@ -397,7 +477,7 @@ private:
 				}
 				fs << ");" << std::endl;
 				delete[] args;
-				return -1;
+				return t;
 			}
 			else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
 				Expr *base = ME->getBase();
@@ -424,8 +504,11 @@ private:
 			}
 		}
 		else if (ReturnStmt *RS = dyn_cast<ReturnStmt>(S)) {
-			int t = generateStatement(RS->getRetValue(), indent);
-			fs << nTabs(indent) << "$return := " << getAsTemp(t) << ";" << std::endl;
+			int t = -1;
+			if (RS->getRetValue()) {
+				t=generateStatement(RS->getRetValue(), indent);
+				fs << nTabs(indent) << "$return := " << getAsTemp(t) << ";" << std::endl;
+			}
 			fs << nTabs(indent) << "return;" << std::endl;
 			return t;
 		}
@@ -451,8 +534,7 @@ private:
 							fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := " << getAsTemp(t) << ";" << std::endl;
 						}
 					}
-				}
-				
+				}		
 			}
 			return -1;
 		}
@@ -479,14 +561,16 @@ public:
 				int rhs_base = getNextTemp();
 				fs << "\t" << getAsTemp(lhs_base) << " := " << (*p)->getName().str() << "$ptr;" << std::endl;
 				symbolTableCreateVar((*p)->getName().str());
-				fs << "\t" << "havoc " << symbolTableGetVar((*p)->getName().str()) << ";" << std::endl;
+				varList.insert(symbolTableGetVar((*p)->getName().str()));
 				fs << "\t" << symbolTableGetVar((*p)->getName().str()) << " := $malloc_" << (*p)->getType()->getAsStructureType()->getDecl()->getName().str() << "(1);" << std::endl;
 				fs << "\t" << getAsTemp(rhs_base) << " := " << symbolTableGetVar((*p)->getName().str()) << ";" << std::endl;
 				generateStructCopy((*p)->getType(), lhs_base, rhs_base, 0, 1);
 			}
 			else {
+				os << (*p)->getName().str() << "$immut : int";
 				symbolTableCreateVar((*p)->getName().str());
-				os << symbolTableGetVar((*p)->getName().str()) << " : int";
+				varList.insert(symbolTableGetVar((*p)->getName().str()));
+				fs << "\t" << symbolTableGetVar((*p)->getName().str()) << " := " << (*p)->getName().str() << "$immut;" << std::endl;
 			}
 			
 			if (p + 1 != F->param_end())
@@ -500,7 +584,7 @@ public:
 			os << "\t" << "var " << *var << " : int;" << std::endl;
 		os << getTemporaryDeclarations();
 		os << fs.str();
-		os << "}";
+		os << "}" << std::endl;
 		symbolTableExitLevel();
 		return true;
 	}
@@ -509,18 +593,23 @@ public:
 
 class BoogieGenConsumer : public clang::ASTConsumer {
 private:
+	CompileChecksVisitor Visitor0;
 	CollectStructInfoVisitor Visitor1;
 	CreateStructDefsVisitor Visitor2;
 	CreateFunctionDefinitionsVisitor Visitor3;
 	
 public:
 	virtual void HandleTranslationUnit(clang::ASTContext &Context) {
+		Visitor0.TraverseDecl(Context.getTranslationUnitDecl());
+		if (compileCheckErrored)
+			return;
 		generateFixedCode();
 		Visitor1.TraverseDecl(Context.getTranslationUnitDecl());
 		Visitor2.TraverseDecl(Context.getTranslationUnitDecl());
 		Visitor3.TraverseDecl(Context.getTranslationUnitDecl());
+		generateInitializeFunction();
 	}
-	explicit BoogieGenConsumer(ASTContext *Context) : Visitor1(Context), Visitor2(Context), Visitor3(Context) {}
+	explicit BoogieGenConsumer(ASTContext *Context) :Visitor0(Context), Visitor1(Context), Visitor2(Context), Visitor3(Context) {}
 };
 
 class BoogieGenAction : public clang::ASTFrontendAction {
