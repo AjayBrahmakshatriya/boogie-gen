@@ -23,6 +23,7 @@ using namespace llvm;
 
 
 std::stringstream os;
+std::set<VarDecl*> globalInits;
 std::map<std::string, int> UID_map;
 std::map<int, std::string> UID_inv_map;
 std::map<int, int> UID_size_map;
@@ -56,25 +57,13 @@ void generateFixedCode(void) {
 
 	//cast in procedure
 	os << "procedure $cast_int(p:int) returns (q:int) {" << std::endl;
-	os << "\tassert $M._C[0][$M._type[p]] == 1;" << std::endl;
+	os << "\tassert p == 0 || $M._C[0][$M._type[p]] == 1;" << std::endl;
 	os << "\tq := p;" << std::endl;
 	os << "}" << std::endl;
 
 }
 
-void generateInitializeFunction(void) {
-	os << "procedure {:entrypoint} $initialize() {" << std::endl;
-	os << "\t" << "var $temp_0 : int;" << std::endl;
-	os << "\t" << "$currAddr := 1024;" << std::endl;
-	for (std::map<std::string, int>::iterator it = UID_map.begin(); it != UID_map.end(); it++) {
-		for (std::map<std::string, int>::iterator it2 = UID_map.begin(); it2 != UID_map.end(); it2++) {
-			os << "\t" << "$M._C[" << it->second << "][" << it2->second << "] := " << ((it->second == it2->second) ? 1 : 0) << ";" << std::endl;
-		}
-	}
 
-	os << "\t" << "call $temp_0 := main();" << std::endl;
-	os << "}" << std::endl;
-}
 
 const QualType getBaseType(QualType t) {
 	if (const ElaboratedType *ET = dyn_cast<ElaboratedType>(t.getTypePtr())) {
@@ -94,13 +83,17 @@ private:
 	ASTContext *Context;
 public:
 	explicit CompileChecksVisitor(ASTContext *Context) : Context(Context) {}
-
+	
 	bool VisitStmt(Stmt *E) {
 		if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
 			if (CE->getCastKind() == CK_LValueToRValue || CE->getCastKind() == CK_FunctionToPointerDecay)
 				return true;
 			if (CE->getType()->isPointerType()) {
 				if (!CE->getSubExpr()->getType()->isPointerType()) {
+					if (IntegerLiteral *IL = dyn_cast<IntegerLiteral>(CE->getSubExpr())) {
+						if (IL->getValue().getSExtValue() == 0)
+							return true;
+					}
 					errs() << CE->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Only pointers can be casted to pointers. Attempted casting " << CE->getSubExpr()->getType().getAsString() << " to " << CE->getType().getAsString() << ".\n";
 					compileCheckErrored = true;
 				}
@@ -131,6 +124,8 @@ private:
 public:
 	
 	bool VisitRecordDecl(RecordDecl *R) {
+		if (R->getDefinition() != R)
+			return true;
 		UID_map[R->getName().str()] = UID;
 		UID_inv_map[UID] = R->getName().str();
 		int count = 0;
@@ -161,6 +156,8 @@ private:
 	ASTContext *Context;
 public:
 	bool VisitRecordDecl(RecordDecl *R) {
+		if (R->getDefinition() != R)
+			return true;
 		int UID = UID_map[R->getName().str()];
 		os << "// UID(" << R->getName().str() << ") = "<<UID<<std::endl;
 		for (RecordDecl::field_iterator f = R->field_begin(); f != R->field_end(); f++) {
@@ -175,7 +172,7 @@ public:
 
 		//struct cast 
 		os << "procedure $cast_" << R->getName().str() << "(p:int) returns (q:int) {" << std::endl;
-		os << "\tassert $M._C[" << UID << "][$M._type[p]] == 1;" << std::endl;
+		os << "\tassert p == 0 ||  $M._C[" << UID << "][$M._type[p]] == 1;" << std::endl;
 		os << "\tq := p;" << std::endl;
 		os << "}" << std::endl;
 		return true;
@@ -186,63 +183,63 @@ public:
 class CreateFunctionDefinitionsVisitor : public RecursiveASTVisitor<CreateFunctionDefinitionsVisitor> {
 private:
 	ASTContext *Context;
-	int tempCount = 0;
-	std::stringstream fs;
-	std::map<int, std::map<std::string, std::string>> symbolTable;
-	int symbolTableLevel=0;
-	std::unordered_set<std::string> varList;
-	void symbolTableEnterLevel(void) {
+	static int tempCount;
+	static std::stringstream fs;
+	static std::map<int, std::map<std::string, std::string>> symbolTable;
+	static int symbolTableLevel;
+	static std::unordered_set<std::string> varList;
+	static void symbolTableEnterLevel(void) {
 		symbolTableLevel++;
 		std::map<std::string, std::string> table;
 		symbolTable[symbolTableLevel] = table;
 	}
-	void symbolTableExitLevel(void) {
+	static void symbolTableExitLevel(void) {
 		symbolTable.erase(symbolTableLevel);
 		symbolTableLevel--;
 	}
-	void symbolTableCreateVar(std::string var) {
+	static void symbolTableCreateVar(std::string var) {
 		std::stringstream ss;
 		ss << var << "$" << symbolTableLevel;
 		symbolTable[symbolTableLevel][var] = ss.str();
 	}
-	std::string symbolTableGetVar(std::string var) {
+	static std::string symbolTableGetVar(std::string var) {
 		for (int i = symbolTableLevel; i >= 0; i--) {
 			if (symbolTable[i].find(var) != symbolTable[i].end())
 				return symbolTable[i][var];
 		}
 		return var;
 	}
-	int getNextTemp() {
+	static int getNextTemp() {
 		int t = tempCount;
 		tempCount++;
 		return t;
 	}
-	void resetTemp() {
+	static void resetTemp() {
 		tempCount = 0;
 	}
-	std::string getAsTemp(int n) {
+	static std::string getAsTemp(int n) {
 		std::stringstream s;
 		s << "$temp_" << n;
 		return s.str();
 	}
-	void generateTabs(int n) {
+	static void generateTabs(int n) {
 		for (int i = 0; i < n; i++)
 			fs << "\t";
 	}
-	std::string nTabs(int n) {
+	static std::string nTabs(int n) {
 		std::stringstream s;
 		for (int i = 0; i < n; i++)
 			s << "\t";
 		return s.str();
 	}
-	std::string getTemporaryDeclarations() {
+	static std::string getTemporaryDeclarations() {
 		std::stringstream s;
 		for (int i = 0; i < tempCount; i++) {
 			s << "\t" << "var " << getAsTemp(i) << " : int;" << std::endl;
 		}
 		return s.str();
 	}
-	int generateStructCopy(QualType t, int lhs_base, int rhs_base, int base_offset, int indent ) {
+	static int generateStructCopy(QualType t, int lhs_base, int rhs_base, int base_offset, int indent ) {
 		RecordDecl *RD = t->getAsStructureType()->getDecl();
 		for (RecordDecl::field_iterator f = RD->field_begin(); f != RD->field_end(); f++) {
 			const QualType t = getBaseType((*f)->getType());
@@ -257,7 +254,7 @@ private:
 		}
 		return rhs_base;
 	}
-	int getElementPtr(Expr *E, int indent) {
+	static int getElementPtr(Expr *E, int indent) {
 		if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
 			return getElementPtr(CE->getSubExpr(), indent);
 		}
@@ -297,7 +294,7 @@ private:
 		}
 		return -1;
 	}
-	std::string getLValue(Expr *E, int indent) {
+	static std::string getLValue(Expr *E, int indent) {
 		if (DeclRefExpr *DE = dyn_cast<DeclRefExpr>(E)) {
 			return symbolTableGetVar(DE->getDecl()->getName().str());
 		}
@@ -335,7 +332,7 @@ private:
 			return getAsTemp(-1);
 		}
 	}
-	int generateStatement(Stmt *S, int indent) {
+	static int generateStatement(Stmt *S, int indent) {
 		if (CompoundStmt *CS = dyn_cast<CompoundStmt>(S)) {
 			int t=-1;
 			symbolTableEnterLevel();
@@ -545,6 +542,16 @@ private:
 		}
 	}
 public:
+	bool VisitVarDecl(VarDecl *VD) {
+		if (VD->hasGlobalStorage()) {
+			symbolTableCreateVar(VD->getName().str());
+			os << "var " << symbolTableGetVar(VD->getName().str()) << " : int;" << "\n";
+			if (VD->hasInit()) {
+				globalInits.insert(VD);
+			}
+		}
+		return true;
+	}
 	bool VisitFunctionDecl(FunctionDecl *F) {
 		if (!F->isThisDeclarationADefinition())
 			return true;
@@ -553,7 +560,7 @@ public:
 		varList.clear();
 		os << "procedure " << F->getName().str() << "(";
 		fs.str(std::string());
-		resetTemp();
+		resetTemp();	
 		for (FunctionDecl::param_iterator p = F->param_begin(); p != F->param_end(); p++) {
 			if ((*p)->getType()->isStructureType()) {
 				os << (*p)->getName().str() << "$ptr" << " : int";
@@ -588,8 +595,44 @@ public:
 		symbolTableExitLevel();
 		return true;
 	}
+	static void generateInitializeFunction(void) {
+		os << "procedure {:entrypoint} $initialize() {" << std::endl;
+		fs.str(std::string());
+		fs << "\t" << "$currAddr := 1024;" << std::endl;
+		for (std::map<std::string, int>::iterator it = UID_map.begin(); it != UID_map.end(); it++) {
+			for (std::map<std::string, int>::iterator it2 = UID_map.begin(); it2 != UID_map.end(); it2++) {
+				fs << "\t" << "$M._C[" << it->second << "][" << it2->second << "] := " << ((it->second == it2->second) ? 1 : 0) << ";" << std::endl;
+			}
+		}	
+		resetTemp();
+		for (std::set<VarDecl*>::iterator it = globalInits.begin(); it != globalInits.end(); it++) {
+			VarDecl *VD = *it;
+			if (VD->getType()->isStructureType()) {
+				int rhs_base = getElementPtr(VD->getInit(), 1);
+				int lhs_base = getNextTemp();
+				fs << "\t" << getAsTemp(lhs_base) << " := " << symbolTableGetVar(VD->getName().str()) << ";" << std::endl;
+				generateStructCopy(VD->getType(), lhs_base, rhs_base, 0, 1);
+			}
+			else {
+				int t = generateStatement(VD->getInit(), 1);
+				fs << "\t" << symbolTableGetVar(VD->getName().str()) << " := " << getAsTemp(t) << ";" << std::endl;
+			}
+		}
+		
+		int t = getNextTemp();
+		fs << "\t" << "call " << getAsTemp(t) << ":= main();" << std::endl;
+		os << getTemporaryDeclarations();
+		os << fs.str();	
+		os << "}" << std::endl;
+	}
 	explicit CreateFunctionDefinitionsVisitor(ASTContext *Context) : Context(Context) {}
 };
+
+int CreateFunctionDefinitionsVisitor::symbolTableLevel = 0;
+int CreateFunctionDefinitionsVisitor::tempCount = 0;
+std::stringstream CreateFunctionDefinitionsVisitor::fs;
+std::map<int, std::map<std::string, std::string>> CreateFunctionDefinitionsVisitor::symbolTable;
+std::unordered_set<std::string> CreateFunctionDefinitionsVisitor::varList;
 
 class BoogieGenConsumer : public clang::ASTConsumer {
 private:
@@ -607,7 +650,7 @@ public:
 		Visitor1.TraverseDecl(Context.getTranslationUnitDecl());
 		Visitor2.TraverseDecl(Context.getTranslationUnitDecl());
 		Visitor3.TraverseDecl(Context.getTranslationUnitDecl());
-		generateInitializeFunction();
+		CreateFunctionDefinitionsVisitor::generateInitializeFunction();
 	}
 	explicit BoogieGenConsumer(ASTContext *Context) :Visitor0(Context), Visitor1(Context), Visitor2(Context), Visitor3(Context) {}
 };
