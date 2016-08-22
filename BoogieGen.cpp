@@ -55,10 +55,20 @@ void generateFixedCode(void) {
 	os << "\tq := p;" << std::endl;
 	os << "}" << std::endl;
 
-	//cast in procedure
+	//cast int procedure
 	os << "procedure $cast_int(p:int) returns (q:int) {" << std::endl;
 	os << "\tassert p == 0 || $M._C[0][$M._type[p]] == 1;" << std::endl;
 	os << "\tq := p;" << std::endl;
+	os << "}" << std::endl;
+
+	//bool_to_int procedure
+	os << "procedure $bool_to_int(p:bool) returns (q:int) {" << std::endl;
+	os << "\tif (p) {" << std::endl;
+	os << "\t\tq := 1;" << std::endl;
+	os << "\t} else {" << std::endl;
+	os << "\t\tq := 0;" << std::endl;
+	os << "\t}" << std::endl;
+	os << "\t return;" << std::endl;
 	os << "}" << std::endl;
 
 }
@@ -223,8 +233,7 @@ private:
 		return s.str();
 	}
 	static void generateTabs(int n) {
-		for (int i = 0; i < n; i++)
-			fs << "\t";
+		fs << nTabs(n);
 	}
 	static std::string nTabs(int n) {
 		std::stringstream s;
@@ -235,7 +244,7 @@ private:
 	static std::string getTemporaryDeclarations() {
 		std::stringstream s;
 		for (int i = 0; i < tempCount; i++) {
-			s << "\t" << "var " << getAsTemp(i) << " : int;" << std::endl;
+			s << nTabs(1) << "var " << getAsTemp(i) << " : int;" << std::endl;
 		}
 		return s.str();
 	}
@@ -365,7 +374,15 @@ private:
 				int lhs = generateStatement(BO->getLHS(), indent);
 				int rhs = generateStatement(BO->getRHS(), indent);
 				int t = getNextTemp();
-				fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << ";" << std::endl;
+				if (BO->getOpcodeStr().str().compare("+")==0 || BO->getOpcodeStr().str().compare("-") == 0 || BO->getOpcodeStr().str().compare("*") == 0 || BO->getOpcodeStr().str().compare("/") == 0 ){
+					fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << ";" << std::endl;
+				}
+				else if (BO->getOpcodeStr().str().compare(">") == 0 || BO->getOpcodeStr().str().compare("<") == 0 || BO->getOpcodeStr().str().compare(">=") == 0 || BO->getOpcodeStr().str().compare("<=") == 0 || BO->getOpcodeStr().str().compare("==") == 0 || BO->getOpcodeStr().str().compare("!=") == 0) {
+					fs << nTabs(indent) << "call " << getAsTemp(t) << " := $bool_to_int( " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << " );" << std::endl;
+				}
+				else {
+					fs << nTabs(indent) << "// Binary operator not handled" << std::endl;
+				}
 				return t;
 			}
 			else if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
@@ -642,7 +659,7 @@ public:
 		}
 		
 		int t = getNextTemp();
-		fs << "\t" << "call " << getAsTemp(t) << ":= main();" << std::endl;
+		fs << "\t" << "call " << getAsTemp(t) << " := main();" << std::endl;
 		os << getTemporaryDeclarations();
 		os << fs.str();	
 		os << "}" << std::endl;
