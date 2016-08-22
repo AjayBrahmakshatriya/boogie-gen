@@ -535,6 +535,28 @@ private:
 			}
 			return -1;
 		}
+		else if (IfStmt *IS = dyn_cast<IfStmt>(S)) {
+			int cond = generateStatement(IS->getCond(), indent);
+			fs << nTabs(indent) << "if ( " << getAsTemp(cond) << " != 0 ) {" << std::endl;
+			generateStatement(IS->getThen(),indent+1);
+			if (IS->getElse() != NULL) {
+				fs << nTabs(indent) << "} else {" << std::endl;
+				generateStatement(IS->getElse(), indent + 1);
+			}
+			fs << nTabs(indent) << "}"<< std::endl;
+			return -1;
+		}
+		else if (WhileStmt *WS = dyn_cast<WhileStmt>(S)) {
+			int t = getNextTemp();
+			int p = generateStatement(WS->getCond(), indent);
+			fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(p) << ";" << std::endl;
+			fs << nTabs(indent) << "while ( " << getAsTemp(t) << " != 0 ) {" << std::endl;
+			generateStatement(WS->getBody(), indent + 1);
+			p = generateStatement(WS->getCond(), indent + 1);
+			fs << nTabs(indent + 1) << getAsTemp(t) << " := " << getAsTemp(p) << ";" << std::endl;
+			fs << nTabs(indent) << "}" << std::endl;
+			return -1;
+		}
 		else {
 			generateTabs(indent);
 			fs << "//Stmt Not Handled yet!"<<std::endl;
@@ -603,7 +625,7 @@ public:
 			for (std::map<std::string, int>::iterator it2 = UID_map.begin(); it2 != UID_map.end(); it2++) {
 				fs << "\t" << "$M._C[" << it->second << "][" << it2->second << "] := " << ((it->second == it2->second) ? 1 : 0) << ";" << std::endl;
 			}
-		}	
+		}
 		resetTemp();
 		for (std::set<VarDecl*>::iterator it = globalInits.begin(); it != globalInits.end(); it++) {
 			VarDecl *VD = *it;
