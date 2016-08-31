@@ -15,6 +15,7 @@
 
 #include <sstream>
 #include <unordered_set>
+#include <fstream>
 
 using namespace clang::tooling;
 using namespace clang::driver;
@@ -35,11 +36,14 @@ void generateFixedCode(void) {
 	os << "var $M._size : [int] int;" << std::endl;
 	os << "var $M._type : [int] int;" << std::endl;
 	os << "var $M._C : [int] [int] int;" << std::endl;
+	os << "var $M._alloc : [int] int;" << std::endl;
+	os << "var $M._typesize : [int] int;" << std::endl;
 	os << "var $currAddr : int;" << std::endl;
 
 	//malloc procedure
 	os << "procedure $malloc(n:int) returns (p:int) {" << std::endl;
 	os << "\tp := $currAddr;" << std::endl;
+	os << "\t$M._alloc[p] := 1;" << std::endl;
 	os << "\t$currAddr := $currAddr + n;" << std::endl;
 	os << "}" << std::endl;
 
@@ -104,6 +108,9 @@ public:
 						if (IL->getValue().getSExtValue() == 0)
 							return true;
 					}
+					if (CE->getSubExpr()->getType()->isArrayType() && CE->getSubExpr()->getType()->getArrayElementTypeNoTypeQual()->isCharType() && CE->getType()->getPointeeType()->isCharType()) {
+						return true;
+					}
 					errs() << CE->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Only pointers can be casted to pointers. Attempted casting " << CE->getSubExpr()->getType().getAsString() << " to " << CE->getType().getAsString() << ".\n";
 					compileCheckErrored = true;
 				}
@@ -159,6 +166,7 @@ public:
 	explicit CollectStructInfoVisitor(ASTContext *Context) : Context(Context), UID(1) {
 		UID_map["int"] = 0;
 		UID_inv_map[0] = "int";
+		UID_size_map[0] = 4;
 	}
 };
 class CreateStructDefsVisitor : public RecursiveASTVisitor<CreateStructDefsVisitor> {
@@ -178,6 +186,7 @@ public:
 		os << "\tcall p := $malloc(n*" << UID_size_map[UID] << ");" << std::endl;
 		os << "\t$M._type[p] := " << UID << ";" << std::endl;
 		os << "\t$M._size[p] := n;" << std::endl;
+
 		os << "}" << std::endl;
 
 		//struct cast 
@@ -198,6 +207,21 @@ private:
 	static std::map<int, std::map<std::string, std::string>> symbolTable;
 	static int symbolTableLevel;
 	static std::unordered_set<std::string> varList;
+	static int string_addr;
+	static std::stringstream string_init;
+
+	static int createStringConst(std::string s) {
+		int t = string_addr;
+		string_init << "\t" << "$M._type[" << string_addr << "] := 0;" << std::endl;
+		for (const char *c = s.c_str(); *c != '\0'; c++) {
+			string_init << "\t" << "$M.int[" << string_addr << "] := " << (int)*c << ";" << std::endl;
+			string_addr++;
+		}
+		string_init << "\t" << "$M.int[" << string_addr << "] := 0;" << std::endl;
+		string_addr++;
+		return t;
+	}
+
 	static void symbolTableEnterLevel(void) {
 		symbolTableLevel++;
 		std::map<std::string, std::string> table;
@@ -274,6 +298,7 @@ private:
 			int t = getNextTemp();
 			if (ME->isArrow()) {
 				b = generateStatement(base, indent);
+				fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(b) << "] != 0;" << std::endl;
 				l_type = base->getType()->getPointeeType()->getAsStructureType()->getDecl()->getName().str();
 			}
 			else {
@@ -286,7 +311,9 @@ private:
 		}
 		else if(UnaryOperator *UO = dyn_cast<UnaryOperator>(E)) {
 			if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*") == 0) {
-				return generateStatement(UO->getSubExpr(),indent);
+				int t = generateStatement(UO->getSubExpr(), indent);
+				fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
+				return t;
 			}
 			else {
 				fs << nTabs(indent) << "// Invalid operator found in getelementptr" << std::endl;
@@ -294,7 +321,9 @@ private:
 			}
 		}
 		else if (DeclRefExpr *DE = dyn_cast<DeclRefExpr>(E)) {
-			return generateStatement(DE, indent);
+			int t = generateStatement(DE, indent);
+			fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
+			return t;
 		}
 		else {
 		//	E->dump();
@@ -311,7 +340,8 @@ private:
 			if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*") == 0) {
 				int t = generateStatement(UO->getSubExpr(), indent);
 				std::stringstream ss;
-				ss << "$M.[" << getAsTemp(t) << "]";
+				fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
+				ss << "$M.int[" << getAsTemp(t) << "]";
 				return ss.str();
 			}
 			else {
@@ -325,6 +355,7 @@ private:
 			std::string l_type;
 			if (ME->isArrow()) {
 				b = generateStatement(base, indent);
+				fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(b) << "] != 0;" << std::endl;
 				l_type = base->getType()->getPointeeType()->getAsStructureType()->getDecl()->getName().str();
 			}
 			else {
@@ -342,11 +373,13 @@ private:
 		}
 	}
 	static int generateStatement(Stmt *S, int indent) {
+		if (S == NULL)
+			return -1;
 		if (CompoundStmt *CS = dyn_cast<CompoundStmt>(S)) {
-			int t=-1;
+			int t = -1;
 			symbolTableEnterLevel();
 			for (CompoundStmt::body_iterator b = CS->body_begin(); b != CS->body_end(); b++) {
-				t=generateStatement(*b, indent);
+				t = generateStatement(*b, indent);
 			}
 			symbolTableExitLevel();
 			return t;
@@ -355,6 +388,11 @@ private:
 			if (IntegerLiteral *I = dyn_cast<IntegerLiteral>(E)) {
 				int t = getNextTemp();
 				fs << nTabs(indent) << getAsTemp(t) << " := " << I->getValue().getSExtValue() << ";" << std::endl;
+				return t;
+			}
+			else if (StringLiteral *SL = dyn_cast<StringLiteral>(E)) {
+				int t = getNextTemp();
+				fs << nTabs(indent) << getAsTemp(t) << " := " << createStringConst(SL->getString().str()) << ";" << std::endl;
 				return t;
 			}
 			else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(E)) {
@@ -374,7 +412,7 @@ private:
 				int lhs = generateStatement(BO->getLHS(), indent);
 				int rhs = generateStatement(BO->getRHS(), indent);
 				int t = getNextTemp();
-				if (BO->getOpcodeStr().str().compare("+")==0 || BO->getOpcodeStr().str().compare("-") == 0 || BO->getOpcodeStr().str().compare("*") == 0 || BO->getOpcodeStr().str().compare("/") == 0 ){
+				if (BO->getOpcodeStr().str().compare("+") == 0 || BO->getOpcodeStr().str().compare("-") == 0 || BO->getOpcodeStr().str().compare("*") == 0 || BO->getOpcodeStr().str().compare("/") == 0) {
 					fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << ";" << std::endl;
 				}
 				else if (BO->getOpcodeStr().str().compare(">") == 0 || BO->getOpcodeStr().str().compare("<") == 0 || BO->getOpcodeStr().str().compare(">=") == 0 || BO->getOpcodeStr().str().compare("<=") == 0 || BO->getOpcodeStr().str().compare("==") == 0 || BO->getOpcodeStr().str().compare("!=") == 0) {
@@ -387,7 +425,7 @@ private:
 			}
 			else if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
 				int t = generateStatement(CE->getSubExpr(), indent);
-				
+
 				if (CE->getCastKind() == CK_LValueToRValue)
 					return t;
 				int r = getNextTemp();
@@ -400,7 +438,7 @@ private:
 					else if (ty->isVoidType()) {
 						tname = "void";
 					}
-					else{
+					else {
 						tname = "int";
 					}
 					fs << nTabs(indent) << "call " << getAsTemp(r) << " := $cast_" << tname << "(" << getAsTemp(t) << ");" << std::endl;
@@ -431,16 +469,16 @@ private:
 				return t;
 			}
 			else if (StmtExpr *SE = dyn_cast<StmtExpr>(E)) {
-				return generateStatement(SE->getSubStmt(), indent);                   
+				return generateStatement(SE->getSubStmt(), indent);
 			}
 			else if (UnaryOperator *UO = dyn_cast<UnaryOperator>(E)) {
 				//fs << nTabs(indent) << "// Unary operator " << UO->getOpcodeStr(UO->getOpcode()).str() << std::endl;
-				if (UO->getOpcodeStr(UO->getOpcode()).str().compare("-")==0) {
-					int t = generateStatement(UO->getSubExpr(),indent);
+				if (UO->getOpcodeStr(UO->getOpcode()).str().compare("-") == 0) {
+					int t = generateStatement(UO->getSubExpr(), indent);
 					fs << nTabs(indent) << getAsTemp(t) << " := 0 - " << getAsTemp(t) << ";" << std::endl;
 					return t;
 				}
-				else if (UO->getOpcodeStr(UO->getOpcode()).str().compare("!")==0) {
+				else if (UO->getOpcodeStr(UO->getOpcode()).str().compare("!") == 0) {
 					int t = generateStatement(UO->getSubExpr(), indent);
 					fs << nTabs(indent) << "if ( " << getAsTemp(t) << " == 0 )" << std::endl;
 					fs << nTabs(indent + 1) << getAsTemp(t) << " := 1;" << std::endl;
@@ -448,8 +486,9 @@ private:
 					fs << nTabs(indent + 1) << getAsTemp(t) << " := 0;" << std::endl;
 					return(t);
 				}
-				else if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*")==0) {
+				else if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*") == 0) {
 					int t = generateStatement(UO->getSubExpr(), indent);
+					fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
 					fs << nTabs(indent) << getAsTemp(t) << " := $M.int[" << getAsTemp(t) << "];" << std::endl;
 					return(t);
 				}
@@ -496,12 +535,13 @@ private:
 			else if (MemberExpr *ME = dyn_cast<MemberExpr>(E)) {
 				Expr *base = ME->getBase();
 				int b;
-				
+
 				int t = getNextTemp();
 				std::string l_type;
 				if (ME->isArrow()) {
 					l_type = base->getType()->getPointeeType()->getAsStructureType()->getDecl()->getName().str();
 					b = generateStatement(base, indent);
+					fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(b) << "] != 0;" << std::endl;
 				}
 				else {
 					b = getElementPtr(base, indent);
@@ -513,14 +553,14 @@ private:
 			}
 			else {
 				generateTabs(indent);
-				fs << "//Expr Not Handled yet!"<<std::endl;
+				fs << "//Expr Not Handled yet!" << std::endl;
 				return -1;
 			}
 		}
 		else if (ReturnStmt *RS = dyn_cast<ReturnStmt>(S)) {
 			int t = -1;
 			if (RS->getRetValue()) {
-				t=generateStatement(RS->getRetValue(), indent);
+				t = generateStatement(RS->getRetValue(), indent);
 				fs << nTabs(indent) << "$return := " << getAsTemp(t) << ";" << std::endl;
 			}
 			fs << nTabs(indent) << "return;" << std::endl;
@@ -548,19 +588,19 @@ private:
 							fs << nTabs(indent) << symbolTableGetVar(VD->getName().str()) << " := " << getAsTemp(t) << ";" << std::endl;
 						}
 					}
-				}		
+				}
 			}
 			return -1;
 		}
 		else if (IfStmt *IS = dyn_cast<IfStmt>(S)) {
 			int cond = generateStatement(IS->getCond(), indent);
 			fs << nTabs(indent) << "if ( " << getAsTemp(cond) << " != 0 ) {" << std::endl;
-			generateStatement(IS->getThen(),indent+1);
+			generateStatement(IS->getThen(), indent + 1);
 			if (IS->getElse() != NULL) {
 				fs << nTabs(indent) << "} else {" << std::endl;
 				generateStatement(IS->getElse(), indent + 1);
 			}
-			fs << nTabs(indent) << "}"<< std::endl;
+			fs << nTabs(indent) << "}" << std::endl;
 			return -1;
 		}
 		else if (WhileStmt *WS = dyn_cast<WhileStmt>(S)) {
@@ -570,6 +610,19 @@ private:
 			fs << nTabs(indent) << "while ( " << getAsTemp(t) << " != 0 ) {" << std::endl;
 			generateStatement(WS->getBody(), indent + 1);
 			p = generateStatement(WS->getCond(), indent + 1);
+			fs << nTabs(indent + 1) << getAsTemp(t) << " := " << getAsTemp(p) << ";" << std::endl;
+			fs << nTabs(indent) << "}" << std::endl;
+			return -1;
+		}
+		else if (ForStmt *FS = dyn_cast<ForStmt>(S)) {
+			int t = getNextTemp();
+			generateStatement(FS->getInit(), indent);
+			int p = generateStatement(FS->getCond(), indent);
+			fs << nTabs(indent) << getAsTemp(t) << " := " << getAsTemp(p) << ";" << std::endl;
+			fs << nTabs(indent) << "while ( " << getAsTemp(t) << " != 0 ) {" << std::endl;
+			generateStatement(FS->getBody(), indent + 1);
+			generateStatement(FS->getInc(), indent + 1);
+			p = generateStatement(FS->getCond(), indent + 1);
 			fs << nTabs(indent + 1) << getAsTemp(t) << " := " << getAsTemp(p) << ";" << std::endl;
 			fs << nTabs(indent) << "}" << std::endl;
 			return -1;
@@ -637,12 +690,14 @@ public:
 	static void generateInitializeFunction(void) {
 		os << "procedure {:entrypoint} $initialize() {" << std::endl;
 		fs.str(std::string());
-		fs << "\t" << "$currAddr := 1024;" << std::endl;
+		fs << "\t" << "$currAddr := "<<string_addr<<";" << std::endl;
 		for (std::map<std::string, int>::iterator it = UID_map.begin(); it != UID_map.end(); it++) {
+			fs << "\t" << "$M._typesize[" << it->second << "] := " << UID_size_map[it->second] << ";" << std::endl;
 			for (std::map<std::string, int>::iterator it2 = UID_map.begin(); it2 != UID_map.end(); it2++) {
 				fs << "\t" << "$M._C[" << it->second << "][" << it2->second << "] := " << ((it->second == it2->second) ? 1 : 0) << ";" << std::endl;
 			}
 		}
+		fs << string_init.str();
 		resetTemp();
 		for (std::set<VarDecl*>::iterator it = globalInits.begin(); it != globalInits.end(); it++) {
 			VarDecl *VD = *it;
@@ -672,7 +727,8 @@ int CreateFunctionDefinitionsVisitor::tempCount = 0;
 std::stringstream CreateFunctionDefinitionsVisitor::fs;
 std::map<int, std::map<std::string, std::string>> CreateFunctionDefinitionsVisitor::symbolTable;
 std::unordered_set<std::string> CreateFunctionDefinitionsVisitor::varList;
-
+std::stringstream CreateFunctionDefinitionsVisitor::string_init;
+int CreateFunctionDefinitionsVisitor::string_addr = 1024;
 class BoogieGenConsumer : public clang::ASTConsumer {
 private:
 	CompileChecksVisitor Visitor0;
@@ -711,7 +767,11 @@ int main(int argc, const char **argv) {
 		CommonOptionsParser OptionsParser(argc, argv, BoogieGenCategory);
 		ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
 		Tool.run(newFrontendActionFactory<BoogieGenAction>().get());
-		errs() << os.str();
+		std::fstream f;
+		f.open("test.bpl", std::ios::out);
+		f << os.str();
+		f.close();
+		//errs() << os.str();
 		return 0;
 	}
 }
