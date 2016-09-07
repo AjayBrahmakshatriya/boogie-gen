@@ -54,6 +54,13 @@ void generateFixedCode(void) {
 	os << "\t$M._size[p] := n;" << std::endl;
 	os << "}" << std::endl;
 
+	//malloc_char procedure
+	os << "procedure malloc_char(n:int) returns (p:int) {" << std::endl;
+	os << "\tcall p := $malloc(n*4);" << std::endl;
+	os << "\t$M._type[p] := 1;" << std::endl;
+	os << "\t$M._size[p] := n;" << std::endl;
+	os << "}" << std::endl;
+
 	//cast void procedure
 	os << "procedure $cast_void(p:int) returns (q:int) {" << std::endl;
 	os << "\tq := p;" << std::endl;
@@ -62,6 +69,14 @@ void generateFixedCode(void) {
 	//cast int procedure
 	os << "procedure $cast_int(p:int) returns (q:int) {" << std::endl;
 	os << "\tassert p == 0 || $M._C[0][$M._type[p]] == 1;" << std::endl;
+	os << "\tassert p == 0 || $M._size[p] == 1;" << std::endl;
+	os << "\tq := p;" << std::endl;
+	os << "}" << std::endl;
+
+	//cast char procedure
+	os << "procedure $cast_char(p:int) returns (q:int) {" << std::endl;
+	os << "\tassert p == 0 || $M._C[1][$M._type[p]] == 1;" << std::endl;
+	os << "\tassert p == 0 || $M._size[p] == 1;" << std::endl;
 	os << "\tq := p;" << std::endl;
 	os << "}" << std::endl;
 
@@ -132,6 +147,32 @@ public:
 		}
 		return true;
 	}
+	bool checkArray(QualType Q) {
+		if (Q->isArrayType()) {
+			return true;
+		}
+		else if (Q->isPointerType()) {
+			return checkArray(Q->getPointeeType());
+		}
+		else {
+			return false;
+		}
+	}
+	bool VisitVarDecl(VarDecl *VD) {
+		if (checkArray(VD->getType())) {
+			errs() << VD->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Array type declarations prohibited in variable declarations.\n";
+			compileCheckErrored = true;
+		}
+		return true;
+	}
+	bool VisitFieldDecl(FieldDecl *FD) {
+		if (checkArray(FD->getType())) {
+			errs() << FD->getLocStart().printToString(Context->getSourceManager()) << " : Error" << " : Array type declarations prohibited in field declarations.\n";
+			compileCheckErrored = true;
+		}
+		return true;
+	}
+	
 };
 
 class CollectStructInfoVisitor : public RecursiveASTVisitor<CollectStructInfoVisitor> {
@@ -163,10 +204,14 @@ public:
 		UID++;
 		return true;
 	}
-	explicit CollectStructInfoVisitor(ASTContext *Context) : Context(Context), UID(1) {
+	explicit CollectStructInfoVisitor(ASTContext *Context) : Context(Context), UID(2) {
 		UID_map["int"] = 0;
 		UID_inv_map[0] = "int";
 		UID_size_map[0] = 4;
+		UID_map["char"] = 1;
+		UID_inv_map[1] = "char";
+		UID_size_map[1] = 1;
+
 	}
 };
 class CreateStructDefsVisitor : public RecursiveASTVisitor<CreateStructDefsVisitor> {
@@ -191,7 +236,8 @@ public:
 
 		//struct cast 
 		os << "procedure $cast_" << R->getName().str() << "(p:int) returns (q:int) {" << std::endl;
-		os << "\tassert p == 0 ||  $M._C[" << UID << "][$M._type[p]] == 1;" << std::endl;
+		os << "\tassert p == 0 || $M._C[" << UID << "][$M._type[p]] == 1;" << std::endl;
+		os << "\tassert p == 0 || $M._size[p] == 1;" << std::endl;
 		os << "\tq := p;" << std::endl;
 		os << "}" << std::endl;
 		return true;
@@ -418,6 +464,9 @@ private:
 				else if (BO->getOpcodeStr().str().compare(">") == 0 || BO->getOpcodeStr().str().compare("<") == 0 || BO->getOpcodeStr().str().compare(">=") == 0 || BO->getOpcodeStr().str().compare("<=") == 0 || BO->getOpcodeStr().str().compare("==") == 0 || BO->getOpcodeStr().str().compare("!=") == 0) {
 					fs << nTabs(indent) << "call " << getAsTemp(t) << " := $bool_to_int( " << getAsTemp(lhs) << " " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << " );" << std::endl;
 				}
+				else if (BO->getOpcodeStr().str().compare("&&") == 0 || BO->getOpcodeStr().str().compare("||") == 0) {
+					fs << nTabs(indent) << "call " << getAsTemp(t) << " := $bool_to_int( " << getAsTemp(lhs) << " != 0 " << BO->getOpcodeStr().str() << " " << getAsTemp(rhs) << " != 0);" << std::endl;
+				}
 				else {
 					fs << nTabs(indent) << "// Binary operator not handled" << std::endl;
 				}
@@ -438,6 +487,9 @@ private:
 					else if (ty->isVoidType()) {
 						tname = "void";
 					}
+					else if (ty->isCharType()) {
+						tname = "char";
+					}
 					else {
 						tname = "int";
 					}
@@ -450,6 +502,7 @@ private:
 				fs << nTabs(indent) << getAsTemp(t) << " := " << CL->getValue() << ";" << std::endl;
 				return t;
 			}
+			
 			else if (AbstractConditionalOperator *CE = dyn_cast<AbstractConditionalOperator>(E)) {
 				int c = generateStatement(CE->getCond(), indent);
 				int f = getNextTemp();
@@ -625,6 +678,10 @@ private:
 			p = generateStatement(FS->getCond(), indent + 1);
 			fs << nTabs(indent + 1) << getAsTemp(t) << " := " << getAsTemp(p) << ";" << std::endl;
 			fs << nTabs(indent) << "}" << std::endl;
+			return -1;
+		}
+		else if (BreakStmt *BS = dyn_cast<BreakStmt>(E)) {
+			fs << nTabs(indent) << "break;" << std::endl;
 			return -1;
 		}
 		else {
