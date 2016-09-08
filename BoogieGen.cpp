@@ -33,6 +33,7 @@ std::map<int, std::map<std::string, int>> field_map;
 
 void generateFixedCode(void) {
 	os << "var $M.int : [int] int;" << std::endl;
+	os << "var $M.char : [int] int;" << std::endl;
 	os << "var $M._size : [int] int;" << std::endl;
 	os << "var $M._type : [int] int;" << std::endl;
 	os << "var $M._C : [int] [int] int;" << std::endl;
@@ -68,6 +69,7 @@ void generateFixedCode(void) {
 
 	//cast int procedure
 	os << "procedure $cast_int(p:int) returns (q:int) {" << std::endl;
+	os << "\tassert p == 0 || $M._alloc[p] == 1;" << std::endl;
 	os << "\tassert p == 0 || $M._C[0][$M._type[p]] == 1;" << std::endl;
 	os << "\tassert p == 0 || $M._size[p] == 1;" << std::endl;
 	os << "\tq := p;" << std::endl;
@@ -75,6 +77,7 @@ void generateFixedCode(void) {
 
 	//cast char procedure
 	os << "procedure $cast_char(p:int) returns (q:int) {" << std::endl;
+	os << "\tassert p == 0 || $M._alloc[p] == 1;" << std::endl;
 	os << "\tassert p == 0 || $M._C[1][$M._type[p]] == 1;" << std::endl;
 	os << "\tassert p == 0 || $M._size[p] == 1;" << std::endl;
 	os << "\tq := p;" << std::endl;
@@ -236,6 +239,7 @@ public:
 
 		//struct cast 
 		os << "procedure $cast_" << R->getName().str() << "(p:int) returns (q:int) {" << std::endl;
+		os << "\tassert p == 0 || $M._alloc[p] == 1;" << std::endl;
 		os << "\tassert p == 0 || $M._C[" << UID << "][$M._type[p]] == 1;" << std::endl;
 		os << "\tassert p == 0 || $M._size[p] == 1;" << std::endl;
 		os << "\tq := p;" << std::endl;
@@ -525,29 +529,68 @@ private:
 				return t;
 			}
 			else if (CastExpr *CE = dyn_cast<CastExpr>(E)) {
-				int t = generateStatement(CE->getSubExpr(), indent);
-
 				if (CE->getCastKind() == CK_LValueToRValue)
-					return t;
-				int r = getNextTemp();
-				if (CE->getType()->isPointerType()) {
-					QualType ty = CE->getType()->getPointeeType();
+					return generateStatement(CE->getSubExpr(), indent);
+				if (CE->getCastKind() != CK_BitCast && CE->getCastKind() != CK_NoOp) {
+					fs << nTabs(indent) << "// Unknown cast type" << std::endl;
+					return -1;
+				}
+				if (!(CE->getType()->isPointerType()))
+					return generateStatement(CE->getSubExpr(), indent);
+
+				if (CallExpr *CA = dyn_cast<CallExpr>(CE->getSubExpr())) {
+					if (ImplicitCastExpr *ICE = dyn_cast<ImplicitCastExpr>(CA->getCallee())) {
+						if (DeclRefExpr *DE = dyn_cast<DeclRefExpr>(ICE->getSubExpr())) {
+							if (FunctionDecl *fdecl = dyn_cast<FunctionDecl>(DE->getFoundDecl())) {
+								if (fdecl->getName().str().compare("typed_malloc")==0) {
+									QualType ty = CE->getType()->getPointeeType();
+									std::string tname;
+									if (ty->isStructureType()) {
+										tname = ty->getAsStructureType()->getDecl()->getName().str();
+									}
+									else if (ty->isCharType()) {
+										tname = "char";
+									}
+									else {
+										tname = "int";
+									}
+									int p = generateStatement(CA->getArgs()[0],indent);
+									int r = getNextTemp();
+									fs << nTabs(indent) << "call " << getAsTemp(r) << " := malloc_" << tname << "(" << getAsTemp(p) << ");" << std::endl;
+									return r;
+								}
+							}
+						}
+					}
+				}
+
+				int t = generateStatement(CE->getSubExpr(), indent);
+				QualType ty = CE->getType();
+				int t_backup = t;
+				while (ty->isPointerType()) {
+					int r = getNextTemp();
+					QualType sub_type = ty->getPointeeType();
 					std::string tname;
-					if (ty->isStructureType()) {
+					if (sub_type->isStructureType()) {
 						tname = ty->getAsStructureType()->getDecl()->getName().str();
 					}
-					else if (ty->isVoidType()) {
+					else if (sub_type->isVoidType()) {
 						tname = "void";
 					}
-					else if (ty->isCharType()) {
+					else if (sub_type->isCharType()) {
 						tname = "char";
 					}
 					else {
 						tname = "int";
 					}
 					fs << nTabs(indent) << "call " << getAsTemp(r) << " := $cast_" << tname << "(" << getAsTemp(t) << ");" << std::endl;
+					ty = sub_type;
+					t = r;
+					if (ty->isPointerType())
+						fs << nTabs(indent) << getAsTemp(t) << " := $M.int[" << getAsTemp(t) << "];" << std::endl;
+					
 				}
-				return r;
+				return t_backup;
 			}
 			else if (CharacterLiteral *CL = dyn_cast<CharacterLiteral>(E)) {
 				int t = getNextTemp();
