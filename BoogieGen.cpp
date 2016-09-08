@@ -258,12 +258,12 @@ private:
 
 	static int createStringConst(std::string s) {
 		int t = string_addr;
-		string_init << "\t" << "$M._type[" << string_addr << "] := 0;" << std::endl;
+		string_init << "\t" << "$M._type[" << string_addr << "] := 1;" << std::endl;
 		for (const char *c = s.c_str(); *c != '\0'; c++) {
-			string_init << "\t" << "$M.int[" << string_addr << "] := " << (int)*c << ";" << std::endl;
+			string_init << "\t" << "$M.char[" << string_addr << "] := " << (int)*c << ";" << std::endl;
 			string_addr++;
 		}
-		string_init << "\t" << "$M.int[" << string_addr << "] := 0;" << std::endl;
+		string_init << "\t" << "$M.char[" << string_addr << "] := 0;" << std::endl;
 		string_addr++;
 		return t;
 	}
@@ -328,7 +328,7 @@ private:
 				generateStructCopy((*f)->getType(), lhs_base, rhs_base, offset, indent);
 			}
 			else {
-				fs << nTabs(indent) << "$M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(lhs_base) << " + " << offset + base_offset << "] = $M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(rhs_base) << " + " << offset + base_offset << "];" << std::endl;
+				fs << nTabs(indent) << "$M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(lhs_base) << " + " << offset + base_offset << "] := $M." << l_type << "." << (*f)->getName().str() << "[" << getAsTemp(rhs_base) << " + " << offset + base_offset << "];" << std::endl;
 			}
 		}
 		return rhs_base;
@@ -371,6 +371,31 @@ private:
 			fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
 			return t;
 		}
+		else if (ParenExpr *PE = dyn_cast<ParenExpr>(E)) {
+			return getElementPtr(PE->getSubExpr(),indent);
+		}
+		else if (ArraySubscriptExpr *AE = dyn_cast<ArraySubscriptExpr>(E)) {
+			int t = generateStatement(AE->getBase(), indent);
+			int r = generateStatement(AE->getIdx(), indent);
+			QualType type = AE->getBase()->getType()->getPointeeType();
+			std::string type_name;
+			if (type->isCharType()) {
+				type_name = "char";
+			}
+			else if (type->isStructureType()) {
+				type_name = type->getAsStructureType()->getDecl()->getName().str();
+			}
+			else {
+				type_name = "int";
+			}
+			int size = UID_size_map[UID_map[type_name]];
+			int address = getNextTemp();
+			fs << nTabs(indent) << getAsTemp(address) << " := " << getAsTemp(t) << " + " << getAsTemp(r) << " * " << size << ";" << std::endl;
+			fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
+			fs << nTabs(indent) << "assert $M._size[" << getAsTemp(t) << "]" << " > " << getAsTemp(r) << ";" << std::endl;
+			fs << nTabs(indent) << "assert " << getAsTemp(r) << " > " << "-1;" << std::endl;
+			return address;
+		}
 		else {
 		//	E->dump();
 			fs << nTabs(indent) << "// Invalid expression found in getelementptr" << std::endl;
@@ -387,7 +412,10 @@ private:
 				int t = generateStatement(UO->getSubExpr(), indent);
 				std::stringstream ss;
 				fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
-				ss << "$M.int[" << getAsTemp(t) << "]";
+				if (UO->getType()->isCharType())
+					ss << "$M.char[" << getAsTemp(t) << "]";
+				else
+					ss << "$M.int[" << getAsTemp(t) << "]";
 				return ss.str();
 			}
 			else {
@@ -411,6 +439,30 @@ private:
 			int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
 			std::stringstream ss;
 			ss << "$M." << l_type << "." << ME->getMemberDecl()->getName().str() << "[" << getAsTemp(b) << " + " << offset << "]";
+			return ss.str();
+		}
+		else if (ParenExpr *PE = dyn_cast<ParenExpr>(E)) {
+			return getLValue(PE->getSubExpr(),indent);
+		}
+		else if (ArraySubscriptExpr *AE = dyn_cast<ArraySubscriptExpr>(E)) {
+			int t = generateStatement(AE->getBase(), indent);
+			int r = generateStatement(AE->getIdx(), indent);
+			QualType type = AE->getBase()->getType()->getPointeeType();
+			std::string type_name;
+			if (type->isCharType()) {
+				type_name = "char";
+			}
+			else {
+				type_name = "int";
+			}
+			int size = UID_size_map[UID_map[type_name]];
+			int address = getNextTemp();
+			fs << nTabs(indent) << getAsTemp(address) << " := " << getAsTemp(t) << " + " << getAsTemp(r) << " * " << size << ";" << std::endl;
+			fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
+			fs << nTabs(indent) << "assert $M._size[" << getAsTemp(t) << "]" << " > " << getAsTemp(r) << ";" << std::endl;
+			fs << nTabs(indent) << "assert " << getAsTemp(r) << " > " << "-1;" << std::endl;
+			std::stringstream ss;
+			ss << "$M." << type_name << "[" << getAsTemp(address) << "]" << std::endl;
 			return ss.str();
 		}
 		else {
@@ -524,6 +576,27 @@ private:
 			else if (StmtExpr *SE = dyn_cast<StmtExpr>(E)) {
 				return generateStatement(SE->getSubStmt(), indent);
 			}
+			else if (ArraySubscriptExpr *AE = dyn_cast<ArraySubscriptExpr>(E)) {
+				int t = generateStatement(AE->getBase(),indent);
+				int r = generateStatement(AE->getIdx(), indent);
+				QualType type = AE->getBase()->getType()->getPointeeType();
+				std::string type_name;
+				if (type->isCharType()) {
+					type_name = "char";
+				}
+				else {
+					type_name = "int";
+				}
+				int size = UID_size_map[UID_map[type_name]];
+				int address = getNextTemp();
+				fs << nTabs(indent) << getAsTemp(address) << " := " << getAsTemp(t) << " + " << getAsTemp(r) << " * " << size << ";" << std::endl;
+				fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
+				fs << nTabs(indent) << "assert $M._size[" << getAsTemp(t) << "]" << " > " << getAsTemp(r) << ";" << std::endl;
+				fs << nTabs(indent) << "assert " << getAsTemp(r) << " > " << "-1;" << std::endl;
+				int value = getNextTemp();
+				fs << nTabs(indent) << getAsTemp(value) << " := $M." << type_name << "[" << getAsTemp(address) << "];" << std::endl;
+				return value;
+			}
 			else if (UnaryOperator *UO = dyn_cast<UnaryOperator>(E)) {
 				//fs << nTabs(indent) << "// Unary operator " << UO->getOpcodeStr(UO->getOpcode()).str() << std::endl;
 				if (UO->getOpcodeStr(UO->getOpcode()).str().compare("-") == 0) {
@@ -542,8 +615,28 @@ private:
 				else if (UO->getOpcodeStr(UO->getOpcode()).str().compare("*") == 0) {
 					int t = generateStatement(UO->getSubExpr(), indent);
 					fs << nTabs(indent) << "assert $M._alloc[" << getAsTemp(t) << "] != 0;" << std::endl;
-					fs << nTabs(indent) << getAsTemp(t) << " := $M.int[" << getAsTemp(t) << "];" << std::endl;
+					if (UO->getType()->isCharType())
+						fs << nTabs(indent) << getAsTemp(t) << " := $M.char[" << getAsTemp(t) << "];" << std::endl;
+					else
+						fs << nTabs(indent) << getAsTemp(t) << " := $M.int[" << getAsTemp(t) << "];" << std::endl;
+					
 					return(t);
+				}
+				else if (UO->isPrefix()) {
+					std::string variable = getLValue(UO->getSubExpr(), indent);
+					int t = getNextTemp();
+					std::string op = UO->isIncrementOp() ? "+" : "-";
+					fs << nTabs(indent) << variable << " := " << variable << " " << op << "1;" << std::endl;
+					fs << nTabs(indent) << getAsTemp(t) << " := " << variable << ";" << std::endl;
+					return t;
+				}
+				else if (UO->isPostfix()) {
+					std::string variable = getLValue(UO->getSubExpr(), indent);
+					int t = getNextTemp();
+					std::string op = UO->isIncrementOp() ? "+" : "-";
+					fs << nTabs(indent) << getAsTemp(t) << " := " << variable << ";" << std::endl;
+					fs << nTabs(indent) << variable << " := " << variable << " " << op << "1;" << std::endl;
+					return t;
 				}
 				else {
 					fs << nTabs(indent) << "//Unary Operator Not Handled yet!" << std::endl;
@@ -603,6 +696,9 @@ private:
 				int offset = field_map[UID_map[l_type]][ME->getMemberDecl()->getName().str()];
 				fs << nTabs(indent) << getAsTemp(t) << " := $M." << l_type << "." << ME->getMemberDecl()->getName().str() << "[" << getAsTemp(b) << " + " << offset << "];" << std::endl;
 				return t;
+			}
+			else if (ParenExpr *PE = dyn_cast<ParenExpr>(E)) {
+				return generateStatement(PE->getSubExpr(),indent);
 			}
 			else {
 				generateTabs(indent);
@@ -828,7 +924,6 @@ int main(int argc, const char **argv) {
 		f.open("test.bpl", std::ios::out);
 		f << os.str();
 		f.close();
-		//errs() << os.str();
 		return 0;
 	}
 }
